@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pay — LagosPay</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="https://js.paystack.co/v1/inline.js"></script>
+</head>
+<body>
+<div class="topbar"><span class="brand">🟢 LagosPay</span><nav></nav></div>
+<div class="wrap">
+  <div class="card paybox">
+    <div id="loading">Loading payment details…</div>
+    <div id="payform" style="display:none">
+      <div style="color:var(--muted)" id="biz"></div>
+      <h2 id="title" style="margin:4px 0"></h2>
+      <div style="color:var(--muted)" id="desc"></div>
+      <div class="amount">₦<span id="amt"></span></div>
+      <div class="msg err" id="p-err"></div>
+      <div class="msg ok" id="p-ok"></div>
+      <form id="pay">
+        <label>Your email<input name="email" type="email" required placeholder="customer@example.com"></label>
+        <button class="btn" type="submit" id="paybtn">Pay with Paystack</button>
+      </form>
+    </div>
+    <div id="done" style="display:none">
+      <h2>✅ Payment successful</h2>
+      <p>Thank you! The business has been notified.</p>
+    </div>
+  </div>
+</div>
+<script>
+const code = location.pathname.split('/').pop();
+async function init() {
+  try {
+    const r = await fetch('/api/pay/' + code);
+    if (!r.ok) throw new Error('This payment link does not exist.');
+    const l = await r.json();
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('payform').style.display = 'block';
+    document.getElementById('biz').textContent = l.businessName;
+    document.getElementById('title').textContent = l.title;
+    document.getElementById('desc').textContent = l.description || '';
+    document.getElementById('amt').textContent = l.amountNaira;
+  } catch (e) {
+    document.getElementById('loading').textContent = e.message;
+  }
+}
+document.getElementById('pay').onsubmit = async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('paybtn');
+  const errBox = document.getElementById('p-err');
+  errBox.textContent = '';
+  btn.disabled = true;
+  try {
+    const email = new FormData(e.target).get('email');
+    const r = await fetch('/api/pay/' + code + '/initiate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error === 'paystack_not_configured' ? 'Payments are not enabled yet — please contact the business.' : (j.error || 'Could not start payment.'));
+    const handler = PaystackPop.setup({
+      key: j.publicKey, email: j.email, amount: j.amountKobo, ref: j.reference, currency: 'NGN',
+      callback: async function () {
+        const v = await fetch('/api/pay/' + code + '/verify', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reference: j.reference })
+        });
+        const vj = await v.json().catch(() => ({}));
+        if (v.ok && vj.status === 'paid') {
+          document.getElementById('payform').style.display = 'none';
+          document.getElementById('done').style.display = 'block';
+        } else {
+          errBox.textContent = 'We could not confirm your payment. If you were charged, the business will follow up.';
+          btn.disabled = false;
+        }
+      },
+      onClose: function () { btn.disabled = false; }
+    });
+    handler.openIframe();
+  } catch (err) { errBox.textContent = err.message; btn.disabled = false; }
+};
+init();
+</script>
+</body>
+</html>

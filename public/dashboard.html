@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — LagosPay</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">🟢 LagosPay</span>
+  <nav><span id="who"></span><button id="logout">Log out</button></nav>
+</div>
+<div class="wrap">
+  <h2>Dashboard</h2>
+  <div class="msg err" id="top-err"></div>
+  <div class="card">
+    <h3>Create payment link</h3>
+    <div class="msg err" id="c-err"></div>
+    <div class="msg ok" id="c-ok"></div>
+    <form id="create">
+      <label>What is it for?<input name="title" required placeholder="e.g. Ankara fabric — 6 yards"></label>
+      <label>Details (optional)<textarea name="description" rows="2" placeholder="Pickup at Balogun shop, etc."></textarea></label>
+      <label>Amount (₦)<input name="amountNaira" required inputmode="decimal" placeholder="25000"></label>
+      <button class="btn" type="submit">Create link</button>
+    </form>
+    <div class="share" id="share" style="display:none"></div>
+  </div>
+
+  <div class="card">
+    <h3>Your links</h3>
+    <div id="links"><span style="color:var(--muted)">Loading…</span></div>
+  </div>
+
+  <div class="card">
+    <h3>Payments</h3>
+    <div id="payments"><span style="color:var(--muted)">Loading…</span></div>
+  </div>
+</div>
+<script>
+const err = (m) => document.getElementById('top-err').textContent = m || '';
+async function api(url, opts = {}) {
+  const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  if (r.status === 401) { location.href = '/'; return; }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'request_failed');
+  return j;
+}
+async function load() {
+  err('');
+  try {
+    const me = await api('/api/me');
+    document.getElementById('who').textContent = me.businessName + ' · ';
+    if (!me.paystackConfigured) {
+      document.getElementById('top-err').textContent = 'Paystack keys are not set on the server — customers cannot pay yet. Add PAYSTACK_SECRET_KEY / PAYSTACK_PUBLIC_KEY to .env.';
+    }
+    const links = await api('/api/links');
+    document.getElementById('links').innerHTML = links.length ? links.map(l =>
+      `<div class="linkline"><span><b>${escapeHtml(l.title)}</b> — ₦${l.amountNaira}<br><a href="${l.url}" target="_blank">${l.url}</a></span><span style="color:var(--muted)">${new Date(l.created_at + 'Z').toLocaleString()}</span></div>`
+    ).join('') : '<span style="color:var(--muted)">No links yet — create your first one above.</span>';
+    const pays = await api('/api/payments');
+    document.getElementById('payments').innerHTML = pays.length ? `<table><tr><th>For</th><th>Customer</th><th>Amount</th><th>Status</th><th></th></tr>${pays.map(p =>
+      `<tr><td>${escapeHtml(p.link_title)}</td><td>${escapeHtml(p.customer_email || '—')}</td><td>₦${p.amountNaira}</td><td><span class="pill ${p.status}">${p.status}</span></td><td>${p.status === 'paid' ? `<button class="btn btn-ghost" data-refund="${p.id}">Refund</button>` : ''}</td></tr>`
+    ).join('')}</table>` : '<span style="color:var(--muted)">No payments yet — share a link to get paid.</span>';
+    document.querySelectorAll('[data-refund]').forEach(b => b.onclick = () => refund(b.dataset.refund, b));
+  } catch (e) { err(e.message); }
+}
+async function refund(id, btn) {
+  if (!confirm('Refund this customer in full via Paystack?')) return;
+  btn.disabled = true;
+  try { const r = await api(`/api/payments/${id}/refund`, { method: 'POST' }); alert('Refund ' + r.status); load(); }
+  catch (e) { alert('Refund failed: ' + e.message); btn.disabled = false; }
+}
+document.getElementById('create').onsubmit = async (e) => {
+  e.preventDefault();
+  document.getElementById('c-err').textContent = '';
+  document.getElementById('c-ok').textContent = '';
+  const f = Object.fromEntries(new FormData(e.target));
+  try {
+    const l = await api('/api/links', { method: 'POST', body: JSON.stringify(f) });
+    document.getElementById('c-ok').textContent = `Link created: ${l.title} — ₦${l.amountNaira}`;
+    const s = document.getElementById('share');
+    s.style.display = 'block';
+    s.innerHTML = `Send this to your customer: <a href="${l.url}" target="_blank">${l.url}</a>`;
+    e.target.reset(); load();
+  } catch (ex) { document.getElementById('c-err').textContent = ex.message === 'amount_invalid' ? 'Enter a valid amount in naira.' : ex.message; }
+};
+document.getElementById('logout').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); location.href = '/'; };
+function escapeHtml(s) { return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+load();
+</script>
+</body>
+</html>
