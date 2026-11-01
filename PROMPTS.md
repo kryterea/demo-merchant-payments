@@ -25,3 +25,9 @@ A few things about payments. When a customer pays less or more than the link amo
 ## 6
 
 Slow down anyone who tries many logins or starts many payments in a short time. When a refund cannot reach Paystack, tell me plainly and let me try again. When I enter zero or more than ten million naira, tell me why it is refused. Show the customer how many seconds to wait before trying again. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
+
+## 7
+
+_Sent in the same session after prompt 6 stopped early._
+
+Finish what you started. Keep any test files inside this folder. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
