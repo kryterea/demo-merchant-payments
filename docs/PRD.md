@@ -62,17 +62,17 @@ Tech summary: Node.js + Express (`server.js`), SQLite via `better-sqlite3` (`dat
 
 A second tap on Pay for the same link + customer email while a payment is still `pending` **reuses the same pending row** (same reference) and does not create a second row. The dashboard therefore shows one pending row per sale, and the customer is charged at most once. This is shown on the pay page ("Tapping Pay twice reuses the same pending payment") and the dashboard ("A repeat Pay tap reuses the same pending payment").
 
-#### 4.3.2 Amount-mismatch rule (money moved — mark paid, refundable)
+#### 4.3.2 Amount-mismatch rule (paid vs asked — refund or collect)
 
-When the Paystack-confirmed charge succeeded but the amount does not exactly match the link amount, the money **did leave the customer's account**, so the payment is marked **`paid`** (with the actual charged amount stored) and appears on the merchant dashboard where it can be **refunded**. Verify returns `{ ok: true, status: 'paid', amount_mismatch: true, message }`. The pay page never says "you were not charged" in this case — it tells the customer the payment was received, not to pay again, and that the merchant will follow up about a refund or balance.
+When the Paystack-confirmed charge succeeded but the amount does not exactly match the link amount, the money **did leave the customer's account**, so the payment is marked **`paid`** but is **never shown as a normal paid sale**: the dashboard flags it **`paid — underpaid`** or **`paid — overpaid`** with both figures side by side (**paid ₦X / asked ₦Y**, actual charge stored in `payments.amount_kobo`, link amount in `payments.expected_kobo`) plus a next step (`next_step`: underpaid → "collect the balance or refund in full and ask for a fresh payment"; overpaid → "refund the difference"). Verify returns `{ ok: true, status: 'paid', amount_mismatch: true, underpaid/overpaid, paid_kobo, expected_kobo, difference_kobo, merchant_action }`. The pay page never says "you were not charged" in this case — it shows "You paid ₦X but this link asked for ₦Y … the merchant will contact you to collect the balance / refund the difference. Please do not pay again."
 
-#### 4.3.3 Failed or closed payments start fresh
+#### 4.3.3 Processing stays pending; only abandoned/failed closes
 
-When Paystack confirms the charge did **not** succeed, the payment is marked **`failed`** and verify returns `{ ok: false, status: 'failed', retryable: true, fresh: true }` telling the customer they were not charged and to tap Pay again for a **fresh** payment (initiate only reuses `pending` rows, so the next tap creates a new row). When the customer closes the Paystack popup without paying, the client calls `POST /api/pay/:code/abandon`, which marks that `pending` row **`abandoned`** so the next tap also starts fresh instead of reusing a stale row.
+When Paystack reports the charge as still moving (`ongoing`, `pending`, `processing`, `queued` — typical for bank transfer or USSD), the payment **stays `pending`** and verify returns `{ ok: true, status: 'pending', waiting: true, gateway_status, message }` telling the customer the payment is still processing, to wait and not tap Pay again yet. This is never reported as failed. Only when Paystack confirms the charge was **`abandoned`** or **`failed`** is the payment marked **`failed`**, with verify returning `{ ok: false, status: 'failed', retryable: true, fresh: true }` telling the customer they were not charged and to tap Pay again for a **fresh** payment (initiate only reuses `pending` rows, so the next tap creates a new row). Any other unknown gateway status also stays `pending` so a late success can still land via verify/webhook. When the customer closes the Paystack popup without paying, the client calls `POST /api/pay/:code/abandon`, which marks that `pending` row **`abandoned`** so the next tap also starts fresh instead of reusing a stale row.
 
 #### 4.3.4 Pending verification wait rule
 
-When Paystack cannot be verified at that moment (webhook verify fails, or client verify errors), the payment **stays `pending`** and the app tells both sides what happens next: the customer is told to wait about a minute then tap Pay again (the pending row is reused) or refresh, and the webhook path is retried by the client-side verify. No silent indefinite wait.
+When Paystack cannot be verified at that moment (webhook verify fails, or client verify errors), the payment **stays `pending`** and the app tells both sides what happens next: the customer is told to wait about a minute then tap Pay again (the pending row is reused) or refresh, and the webhook path is retried by the client-side verify. No silent indefinite wait. The merchant dashboard shows every pending row with **how long it has been waiting** (`waiting_label`, e.g. "waiting 2m 10s") and **what to do next** (`next_step`: under 5 min → "still within normal bank-transfer/USSD window: wait, then ask the customer to refresh"; 5+ min → "ask the customer to tap Pay / refresh so verify runs again, then check the Paystack dashboard for this reference").
 
 #### 4.3.5 Cross-link reference guard
 
@@ -82,7 +82,7 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 
 ### 4.4 Dashboard payments and refunds
 
-- List: `GET /api/payments` — merchant's payments joined with link titles, newest first (limit 200), amounts formatted in ₦, each row showing the Paystack reference + customer email so merchants can match rows.
+- List: `GET /api/payments` — merchant's payments joined with link titles, newest first (limit 200), amounts formatted in ₦, each row showing the Paystack reference + customer email so merchants can match rows. Paid-vs-asked mismatch rows include `expected_kobo/expectedNaira`, `amount_mismatch/underpaid/overpaid`, and `next_step`; pending rows include `waiting_secs/waiting_label` and `next_step`.
 - Statuses: `pending`, `paid`, `failed`, `abandoned`, `refunded`, `refund_pending`.
 - Refund: `POST /api/payments/:id/refund` — only `paid` payments with a stored `paystack_id`. Calls Paystack `POST /refund` with the transaction id. `refunded` on success, `refund_pending` if Paystack queues it. Full refunds only.
 - UI: payments table with status pills and a per-row Refund button (with confirm dialog).
@@ -92,7 +92,7 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 - `merchants(id, business_name, email UNIQUE, password_hash, created_at)`
 - `sessions(token PK, merchant_id, created_at)`
 - `links(id, merchant_id, code UNIQUE, title, description, amount_kobo, created_at)`
-- `payments(id, link_id, merchant_id, reference UNIQUE, amount_kobo, customer_email, status, paystack_id, paid_at, created_at)`
+- `payments(id, link_id, merchant_id, reference UNIQUE, amount_kobo, expected_kobo, customer_email, status, paystack_id, paid_at, created_at)` — `amount_kobo` is what the customer actually paid, `expected_kobo` is what the link asked for (set at initiate; backfilled to `amount_kobo` for old rows).
 
 ### 4.6 Configuration
 
@@ -106,7 +106,7 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 - No search/filter/export on payments; list capped at 200.
 - Links cannot be edited, disabled, or given expiry dates or stock limits.
 - No customer receipts beyond the Paystack confirmation; no merchant notifications (email/SMS).
-- Amount mismatch on verify is marked `paid` with the actual charged amount and is refundable (see §4.3.2).
+- Amount mismatch on verify is marked `paid` but flagged underpaid/overpaid with paid-vs-asked amounts and collect/refund guidance (see §4.3.2).
 
 ## 6. What is next — Monthly Subscriptions (priority feature)
 
