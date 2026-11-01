@@ -43,6 +43,7 @@ db.exec(`
     merchant_id INTEGER NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
     reference TEXT NOT NULL UNIQUE,
     amount_kobo INTEGER NOT NULL,
+    expected_kobo INTEGER,
     customer_email TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     paystack_id INTEGER,
@@ -50,6 +51,15 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+// Migration for existing DBs: keep the amount the customer actually paid in
+// amount_kobo and the link amount in expected_kobo so mismatches can show both.
+try {
+  const cols = db.prepare('PRAGMA table_info(payments)').all().map((c) => c.name);
+  if (!cols.includes('expected_kobo')) {
+    db.exec('ALTER TABLE payments ADD COLUMN expected_kobo INTEGER');
+  }
+  db.exec(`UPDATE payments SET expected_kobo = amount_kobo WHERE expected_kobo IS NULL`);
+} catch (e) { /* best-effort migration; fresh DBs already have the column */ }
 
 // --- helpers ---
 const naira = (kobo) => (kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -90,6 +100,19 @@ function markPaid(payment, data) {
   return db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id);
 }
 
+// Paystack gateway statuses that mean the money is still moving (bank
+// transfer, USSD): keep the row pending and tell the customer to wait.
+// Only 'abandoned' and 'failed' mean the payment is closed.
+const PROCESSING_STATUSES = new Set(['ongoing', 'pending', 'processing', 'queued']);
+const CLOSED_STATUSES = new Set(['abandoned', 'failed']);
+
+function mismatchInfo(payment, chargedKobo) {
+  const expected = payment.expected_kobo != null ? payment.expected_kobo : payment.amount_kobo;
+  const paid = typeof chargedKobo === 'number' ? chargedKobo : payment.amount_kobo;
+  const diff = paid - expected;
+  return { expected, paid, diff };
+}
+
 // --- middleware ---
 function auth(req, res, next) {
   const token = req.cookies && req.cookies.sid;
@@ -118,7 +141,12 @@ app.post('/webhook/paystack', express.raw({ type: 'application/json' }), async (
           if (data.status === 'success') {
             markPaid(payment, data);
             if (typeof data.amount === 'number' && data.amount !== payment.amount_kobo) {
-              db.prepare('UPDATE payments SET amount_kobo = ? WHERE id = ?').run(data.amount, payment.id);
+              // Keep what the customer actually paid in amount_kobo and the
+              // link amount in expected_kobo so the dashboard shows both
+              // (paid vs asked-for) instead of a normal paid row.
+              db.prepare('UPDATE payments SET amount_kobo = ?, expected_kobo = COALESCE(expected_kobo, ?) WHERE id = ?').run(data.amount, payment.amount_kobo, payment.id);
+            } else if (payment.expected_kobo == null) {
+              db.prepare('UPDATE payments SET expected_kobo = amount_kobo WHERE id = ?').run(payment.id);
             }
           }
         } catch (e) { /* leave pending; client-side verify will retry */ }
@@ -201,10 +229,43 @@ app.get('/api/links', auth, (req, res) => {
 // --- merchant: payments + refund ---
 app.get('/api/payments', auth, (req, res) => {
   const rows = db.prepare(
-    `SELECT p.*, l.title AS link_title FROM payments p JOIN links l ON l.id = p.link_id
+    `SELECT p.*, l.title AS link_title, l.amount_kobo AS link_amount_kobo FROM payments p JOIN links l ON l.id = p.link_id
      WHERE p.merchant_id = ? ORDER BY p.id DESC LIMIT 200`
   ).all(req.merchant.id);
-  res.json(rows.map((p) => ({ ...p, amountNaira: naira(p.amount_kobo) })));
+  const now = Date.now();
+  res.json(rows.map((p) => {
+    const expected = p.expected_kobo != null ? p.expected_kobo : (p.link_amount_kobo != null ? p.link_amount_kobo : p.amount_kobo);
+    const mismatch = p.status === 'paid' && p.amount_kobo !== expected;
+    let waitingSecs = null;
+    let waitingLabel = null;
+    let nextStep = null;
+    if (p.status === 'pending') {
+      const created = Date.parse((p.created_at || '').replace(' ', 'T') + 'Z');
+      waitingSecs = Number.isFinite(created) ? Math.max(0, Math.round((now - created) / 1000)) : null;
+      waitingLabel = waitingSecs == null ? 'waiting — time unknown'
+        : waitingSecs < 60 ? `waiting ${waitingSecs}s`
+        : `waiting ${Math.floor(waitingSecs / 60)}m ${waitingSecs % 60}s`;
+      nextStep = waitingSecs != null && waitingSecs >= 300
+        ? 'Pending 5+ min: ask the customer to tap Pay / refresh so verify runs again, then check the Paystack dashboard for this reference. Only refund/close when Paystack says failed or abandoned.'
+        : 'Still within normal bank-transfer/USSD window: wait, then ask the customer to refresh or tap Pay again (pending row is reused). Do not create a duplicate.';
+    } else if (mismatch) {
+      nextStep = p.amount_kobo < expected
+        ? `Underpaid by ₦${naira(expected - p.amount_kobo)}: collect the balance or refund in full and ask for a fresh payment.`
+        : `Overpaid by ₦${naira(p.amount_kobo - expected)}: refund the difference (full refund via Paystack, settle outside) or refund in full.`;
+    }
+    return {
+      ...p,
+      expected_kobo: expected,
+      expectedNaira: naira(expected),
+      amountNaira: naira(p.amount_kobo),
+      amount_mismatch: mismatch,
+      underpaid: mismatch && p.amount_kobo < expected,
+      overpaid: mismatch && p.amount_kobo > expected,
+      waiting_secs: waitingSecs,
+      waiting_label: waitingLabel,
+      next_step: nextStep,
+    };
+  }));
 });
 
 app.post('/api/payments/:id/refund', auth, async (req, res) => {
@@ -262,8 +323,8 @@ app.post('/api/pay/:code/initiate', (req, res) => {
   }
   const reference = newReference();
   db.prepare(
-    'INSERT INTO payments (link_id, merchant_id, reference, amount_kobo, customer_email) VALUES (?, ?, ?, ?, ?)'
-  ).run(link.id, link.merchant_id, reference, link.amount_kobo, emailNorm);
+    'INSERT INTO payments (link_id, merchant_id, reference, amount_kobo, expected_kobo, customer_email) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(link.id, link.merchant_id, reference, link.amount_kobo, link.amount_kobo, emailNorm);
   res.json({ publicKey: PAYSTACK_PUBLIC, reference, amountKobo: link.amount_kobo, email: emailNorm, reused: false });
 });
 
@@ -302,20 +363,59 @@ app.post('/api/pay/:code/verify', async (req, res) => {
       // Record it as paid so the merchant sees it on the dashboard and can refund it.
       // Never tell the customer they were not charged in this branch.
       const paid = markPaid(payment, data);
-      if (data.amount === payment.amount_kobo) {
+      if (data.amount === (payment.expected_kobo != null ? payment.expected_kobo : payment.amount_kobo)) {
+        if (payment.expected_kobo == null) {
+          db.prepare('UPDATE payments SET expected_kobo = amount_kobo WHERE id = ?').run(payment.id);
+        }
         return res.json({ ok: true, status: 'paid' });
       }
       if (typeof data.amount === 'number' && data.amount !== payment.amount_kobo) {
-        db.prepare('UPDATE payments SET amount_kobo = ? WHERE id = ?').run(data.amount, payment.id);
+        db.prepare('UPDATE payments SET amount_kobo = ?, expected_kobo = COALESCE(expected_kobo, ?) WHERE id = ?').run(data.amount, payment.amount_kobo, payment.id);
       }
-      const expectedNaira = naira(payment.amount_kobo);
-      const paidNaira = (typeof data.amount === 'number') ? naira(data.amount) : null;
+      const { expected, paid: paidKobo, diff } = mismatchInfo(payment, data.amount);
+      const expectedNaira = naira(expected);
+      const paidNaira = naira(paidKobo);
+      const action = diff < 0
+        ? `Please collect the remaining ₦${naira(-diff)} from the customer, or refund this payment and ask them to pay the full amount again.`
+        : `Please refund the extra ₦${naira(diff)} to the customer.`;
       return res.json({
         ok: true,
         status: 'paid',
         amount_mismatch: true,
+        underpaid: diff < 0,
+        overpaid: diff > 0,
         reference: payment.reference,
-        message: `You paid${paidNaira ? ` ₦${paidNaira}` : ''} which does not match the link amount (₦${expectedNaira}). Your payment was received and is shown to the merchant, who will contact you about a refund or balance. Please do not pay again.`,
+        paid_kobo: paidKobo,
+        paid_naira: paidNaira,
+        expected_kobo: expected,
+        expected_naira: expectedNaira,
+        difference_kobo: diff,
+        merchant_action: action,
+        message: `You paid ₦${paidNaira} but this link asked for ₦${expectedNaira}. Your payment was received — it is flagged on the merchant dashboard as paid ₦${paidNaira} / asked ₦${expectedNaira}, and the merchant will contact you to ${diff < 0 ? 'collect the balance' : 'refund the difference'}. Please do not pay again.`,
+      });
+    }
+    // Still moving (bank transfer / USSD / queued): keep the row pending and
+    // tell the customer to wait — never report this as failed.
+    if (PROCESSING_STATUSES.has(data.status)) {
+      return res.json({
+        ok: true,
+        status: 'pending',
+        waiting: true,
+        reference: payment.reference,
+        gateway_status: data.status,
+        message: 'Your payment is still processing (e.g. bank transfer or USSD can take a few minutes). Please wait and do not tap Pay again yet — this page will confirm automatically, or tap Verify / refresh in a few minutes.',
+      });
+    }
+    // Only abandoned or failed closes the payment. Anything else unknown
+    // stays pending so a late success can still land via verify/webhook.
+    if (!CLOSED_STATUSES.has(data.status)) {
+      return res.json({
+        ok: true,
+        status: 'pending',
+        waiting: true,
+        reference: payment.reference,
+        gateway_status: data.status,
+        message: 'Your payment is still processing. Please wait a few minutes, then refresh or tap Pay again (your pending payment will be reused) — do not start a new payment elsewhere.',
       });
     }
     // Paystack confirms the charge did NOT succeed: mark failed so the

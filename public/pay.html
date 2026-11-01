@@ -82,12 +82,19 @@ document.getElementById('pay').onsubmit = async (e) => {
           document.getElementById('done').style.display = 'block';
         } else if (v.ok && vj.status === 'paid' && vj.amount_mismatch) {
           // Money left the customer's account, so never say "not charged".
-          // The payment is on the merchant dashboard for a refund/balance follow-up.
+          // Show paid vs asked-for so both sides know to refund/collect.
           document.getElementById('payform').style.display = 'none';
           const done = document.getElementById('done');
           done.style.display = 'block';
-          done.querySelector('h2').textContent = '⚠️ Payment received with wrong amount';
-          done.querySelector('p').textContent = vj.message || 'Your payment was received and is shown to the merchant, who will contact you about a refund or balance. Please do not pay again.';
+          done.querySelector('h2').textContent = vj.underpaid ? '⚠️ Payment received — less than asked' : '⚠️ Payment received — more than asked';
+          done.querySelector('p').textContent = (vj.paid_naira && vj.expected_naira)
+            ? `You paid ₦${vj.paid_naira} but this link asked for ₦${vj.expected_naira}. It is flagged to the merchant (paid ₦${vj.paid_naira} / asked ₦${vj.expected_naira}) who will contact you to ${vj.underpaid ? 'collect the balance' : 'refund the difference'}. Please do not pay again.`
+            : (vj.message || 'Your payment was received and is shown to the merchant, who will contact you about a refund or balance. Please do not pay again.');
+        } else if (v.ok && vj.status === 'pending') {
+          // Still processing (bank transfer / USSD): keep waiting, not failed.
+          errBox.textContent = '';
+          okBox.textContent = vj.message || 'Your payment is still processing. Please wait a few minutes, then refresh or tap Pay again — do not start a new payment.';
+          btn.disabled = false;
         } else if (vj.status === 'failed' || (vj.retryable && vj.fresh)) {
           // Failed: nothing was charged, so start a fresh payment next tap
           // (initiate only reuses pending rows, so this creates a new one).
