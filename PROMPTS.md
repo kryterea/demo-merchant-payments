@@ -35,3 +35,9 @@ Finish what you started. Keep any test files inside this folder. Tell Kryterea w
 ## 8
 
 Write in the PRD what I see when a refund cannot reach Paystack: the message, that the payment stays paid, and that I can try again. Write in the PRD the exact message a customer sees when they use a payment reference on the wrong link, where it shows, and that nothing is charged. For the request limits, do not trust the address a client says it has unless the app sits behind a proxy I set in .env. Also limit login tries per email, and forget old attempts so memory stays small. Keep any test files inside this folder. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
+
+## 9
+
+_Sent in the same session after prompt 8 stopped when it tried to read .env._
+
+Never read .env, it holds my keys. Add any new setting to .env.example instead. Now finish prompt 8. Keep any test files inside this folder. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
