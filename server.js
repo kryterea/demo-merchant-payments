@@ -106,6 +106,68 @@ function markPaid(payment, data) {
 const PROCESSING_STATUSES = new Set(['ongoing', 'pending', 'processing', 'queued']);
 const CLOSED_STATUSES = new Set(['abandoned', 'failed']);
 
+// How long the customer should wait before tapping Pay / Verify again after
+// an unclear verification. Shown as exact seconds on the pay page.
+const VERIFY_RETRY_WAIT_SECS = Number(process.env.VERIFY_RETRY_WAIT_SECS) || 60;
+
+// --- request throttling (in-memory, per IP) ---
+// Slows down password guessing and floods of fake pending payments.
+// Limits are configurable by environment; all 429s carry retry_after_secs
+// so the client can show "wait N seconds".
+const RATE_LIMITS = {
+  signup: {
+    limit: Number(process.env.RATE_SIGNUP_LIMIT) || 10,
+    windowSecs: Number(process.env.RATE_SIGNUP_WINDOW_SECS) || 600,
+  },
+  login: {
+    limit: Number(process.env.RATE_LOGIN_LIMIT) || 10,
+    windowSecs: Number(process.env.RATE_LOGIN_WINDOW_SECS) || 600,
+  },
+  initiate: {
+    limit: Number(process.env.RATE_INITIATE_LIMIT) || 20,
+    windowSecs: Number(process.env.RATE_INITIATE_WINDOW_SECS) || 600,
+  },
+  verify: {
+    limit: Number(process.env.RATE_VERIFY_LIMIT) || 30,
+    windowSecs: Number(process.env.RATE_VERIFY_WINDOW_SECS) || 600,
+  },
+};
+const _hits = new Map(); // key -> number[] timestamps (ms)
+function clientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+function checkRate(key, limit, windowSecs) {
+  const now = Date.now();
+  const windowMs = windowSecs * 1000;
+  let arr = _hits.get(key);
+  if (!arr) { arr = []; _hits.set(key, arr); }
+  while (arr.length && now - arr[0] > windowMs) arr.shift();
+  if (arr.length >= limit) {
+    const retryAfter = Math.ceil((arr[0] + windowMs - now) / 1000);
+    return { allowed: false, retryAfterSecs: Math.max(1, retryAfter) };
+  }
+  arr.push(now);
+  return { allowed: true, retryAfterSecs: 0 };
+}
+function rateLimit(bucket) {
+  const cfg = RATE_LIMITS[bucket];
+  return (req, res, next) => {
+    const key = `${bucket}:${clientIp(req)}`;
+    const r = checkRate(key, cfg.limit, cfg.windowSecs);
+    if (!r.allowed) {
+      res.set('Retry-After', String(r.retryAfterSecs));
+      return res.status(429).json({
+        error: 'too_many_requests',
+        retry_after_secs: r.retryAfterSecs,
+        message: `Too many attempts. Please wait ${r.retryAfterSecs} seconds before trying again.`,
+      });
+    }
+    next();
+  };
+}
+
 function mismatchInfo(payment, chargedKobo) {
   const expected = payment.expected_kobo != null ? payment.expected_kobo : payment.amount_kobo;
   const paid = typeof chargedKobo === 'number' ? chargedKobo : payment.amount_kobo;
@@ -162,7 +224,7 @@ app.use(express.json());
 app.use(cookieParser());
 
 // --- auth ---
-app.post('/api/auth/signup', (req, res) => {
+app.post('/api/auth/signup', rateLimit('signup'), (req, res) => {
   const { businessName, email, password } = req.body || {};
   if (!businessName || !businessName.trim()) return res.status(400).json({ error: 'business_name_required' });
   if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'valid_email_required' });
@@ -179,7 +241,7 @@ app.post('/api/auth/signup', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', rateLimit('login'), (req, res) => {
   const { email, password } = req.body || {};
   const m = db.prepare('SELECT * FROM merchants WHERE email = ?').get((email || '').toLowerCase());
   if (!m || !bcrypt.compareSync(password || '', m.password_hash)) {
@@ -209,9 +271,14 @@ app.get('/api/me', auth, (req, res) => {
 // --- merchant: links ---
 app.post('/api/links', auth, (req, res) => {
   const { amountNaira, title, description } = req.body || {};
-  if (!title || !String(title).trim()) return res.status(400).json({ error: 'title_required' });
+  if (!title || !String(title).trim()) return res.status(400).json({ error: 'title_required', message: 'Enter what the payment is for.' });
   const n = Number(amountNaira);
-  if (!Number.isFinite(n) || n <= 0 || n > 10000000) return res.status(400).json({ error: 'amount_invalid' });
+  if (!Number.isFinite(n) || n <= 0) {
+    return res.status(400).json({ error: 'amount_must_be_positive', message: 'Amount must be more than ₦0. Enter an amount above zero.' });
+  }
+  if (n > 10000000) {
+    return res.status(400).json({ error: 'amount_too_large', message: 'Amount is above the ₦10,000,000 limit. Enter ₦10,000,000 or less, or split it into smaller links.' });
+  }
   const amountKobo = Math.round(n * 100);
   const code = newCode();
   const info = db.prepare(
@@ -270,10 +337,10 @@ app.get('/api/payments', auth, (req, res) => {
 
 app.post('/api/payments/:id/refund', auth, async (req, res) => {
   const p = db.prepare('SELECT * FROM payments WHERE id = ? AND merchant_id = ?').get(req.params.id, req.merchant.id);
-  if (!p) return res.status(404).json({ error: 'payment_not_found' });
-  if (p.status !== 'paid') return res.status(400).json({ error: 'only_paid_can_refund' });
-  if (!p.paystack_id) return res.status(400).json({ error: 'no_paystack_transaction' });
-  if (!PAYSTACK_SECRET) return res.status(503).json({ error: 'paystack_not_configured' });
+  if (!p) return res.status(404).json({ error: 'payment_not_found', message: 'Payment not found.' });
+  if (p.status !== 'paid') return res.status(400).json({ error: 'only_paid_can_refund', status: p.status, retryable: false, message: `Only paid payments can be refunded. This payment is "${p.status}".` });
+  if (!p.paystack_id) return res.status(400).json({ error: 'no_paystack_transaction', status: p.status, retryable: false, message: 'No Paystack transaction is stored for this payment, so it cannot be refunded from here. Check the Paystack dashboard.' });
+  if (!PAYSTACK_SECRET) return res.status(503).json({ error: 'paystack_not_configured', status: p.status, retryable: true, message: 'Paystack keys are not set on the server. Add them to .env, then try the refund again.' });
   try {
     const r = await fetch('https://api.paystack.co/refund', {
       method: 'POST',
@@ -281,12 +348,35 @@ app.post('/api/payments/:id/refund', auth, async (req, res) => {
       body: JSON.stringify({ transaction: p.paystack_id }),
     });
     const body = await r.json().catch(() => ({}));
-    if (!r.ok || !body.status) return res.status(502).json({ error: body.message || 'refund_failed' });
+    if (!r.ok || !body.status) {
+      // Paystack refused or errored: money did NOT move. Keep the row paid
+      // so the merchant can safely try again — never mark refunded here.
+      return res.status(502).json({
+        error: 'refund_not_completed',
+        status: 'paid',
+        retryable: true,
+        message: 'The refund could not reach Paystack, so the payment is still paid and no money moved. Check your connection / Paystack dashboard, then press Refund again.',
+        detail: body.message || 'paystack_refund_failed',
+      });
+    }
     const status = body.data && body.data.status === 'pending' ? 'refund_pending' : 'refunded';
     db.prepare('UPDATE payments SET status = ? WHERE id = ?').run(status, p.id);
-    res.json({ ok: true, status });
+    res.json({
+      ok: true,
+      status,
+      message: status === 'refunded'
+        ? 'Refund completed on Paystack.'
+        : 'Refund is queued on Paystack and will complete shortly — check the Paystack dashboard if it stays pending.',
+    });
   } catch (e) {
-    res.status(502).json({ error: 'refund_failed' });
+    // Network/timeout reaching Paystack: keep paid, tell the merchant plainly
+    // to try again. No state change, so a retry is always safe.
+    res.status(502).json({
+      error: 'refund_not_completed',
+      status: 'paid',
+      retryable: true,
+      message: 'The refund could not reach Paystack (network error), so the payment is still paid and no money moved. Try the refund again.',
+    });
   }
 });
 
@@ -305,7 +395,7 @@ app.get('/api/pay/:code', (req, res) => {
   });
 });
 
-app.post('/api/pay/:code/initiate', (req, res) => {
+app.post('/api/pay/:code/initiate', rateLimit('initiate'), (req, res) => {
   if (!PAYSTACK_PUBLIC || !PAYSTACK_SECRET) return res.status(503).json({ error: 'paystack_not_configured' });
   const link = db.prepare('SELECT * FROM links WHERE code = ?').get(req.params.code);
   if (!link) return res.status(404).json({ error: 'link_not_found' });
@@ -344,7 +434,7 @@ app.post('/api/pay/:code/abandon', (req, res) => {
   res.json({ ok: true, status: payment.status === 'pending' ? 'abandoned' : payment.status });
 });
 
-app.post('/api/pay/:code/verify', async (req, res) => {
+app.post('/api/pay/:code/verify', rateLimit('verify'), async (req, res) => {
   if (!PAYSTACK_SECRET) return res.status(503).json({ error: 'paystack_not_configured' });
   const { reference } = req.body || {};
   if (!reference) return res.status(400).json({ error: 'reference_required' });
@@ -395,15 +485,16 @@ app.post('/api/pay/:code/verify', async (req, res) => {
       });
     }
     // Still moving (bank transfer / USSD / queued): keep the row pending and
-    // tell the customer to wait — never report this as failed.
+    // tell the customer exactly how long to wait — never report this as failed.
     if (PROCESSING_STATUSES.has(data.status)) {
       return res.json({
         ok: true,
         status: 'pending',
         waiting: true,
+        retry_after_secs: VERIFY_RETRY_WAIT_SECS,
         reference: payment.reference,
         gateway_status: data.status,
-        message: 'Your payment is still processing (e.g. bank transfer or USSD can take a few minutes). Please wait and do not tap Pay again yet — this page will confirm automatically, or tap Verify / refresh in a few minutes.',
+        message: `Your payment is still processing (e.g. bank transfer or USSD can take a few minutes). Please wait ${VERIFY_RETRY_WAIT_SECS} seconds and do not tap Pay again yet — this page will confirm automatically, or tap Verify / refresh after the wait.`,
       });
     }
     // Only abandoned or failed closes the payment. Anything else unknown
@@ -413,9 +504,10 @@ app.post('/api/pay/:code/verify', async (req, res) => {
         ok: true,
         status: 'pending',
         waiting: true,
+        retry_after_secs: VERIFY_RETRY_WAIT_SECS,
         reference: payment.reference,
         gateway_status: data.status,
-        message: 'Your payment is still processing. Please wait a few minutes, then refresh or tap Pay again (your pending payment will be reused) — do not start a new payment elsewhere.',
+        message: `Your payment is still processing. Please wait ${VERIFY_RETRY_WAIT_SECS} seconds, then refresh or tap Pay again (your pending payment will be reused) — do not start a new payment elsewhere.`,
       });
     }
     // Paystack confirms the charge did NOT succeed: mark failed so the
@@ -433,14 +525,16 @@ app.post('/api/pay/:code/verify', async (req, res) => {
     });
   } catch (e) {
     // Webhook-wait timing rule (PRD §4.3.4): when Paystack cannot be verified right
-    // now the payment stays pending and both sides are told to wait briefly, then
-    // tap Pay / refresh — the pending row is reused so no duplicate is created.
+    // now the payment stays pending and both sides get an exact wait in seconds,
+    // then tap Pay / refresh — the pending row is reused so no duplicate is created.
     return res.status(502).json({
       error: 'verify_failed',
       status: 'pending',
       retryable: true,
+      waiting: true,
+      retry_after_secs: VERIFY_RETRY_WAIT_SECS,
       reference: payment.reference,
-      message: 'We could not confirm your payment yet. Please wait about a minute, then tap Pay again (your pending payment will be reused) or refresh this page.',
+      message: `We could not confirm your payment yet. Please wait ${VERIFY_RETRY_WAIT_SECS} seconds, then tap Pay again (your pending payment will be reused) or refresh this page.`,
     });
   }
 });

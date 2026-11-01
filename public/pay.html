@@ -23,7 +23,8 @@
         <label>Your email<input name="email" type="email" required placeholder="customer@example.com"></label>
         <button class="btn" type="submit" id="paybtn">Pay with Paystack</button>
       </form>
-      <p style="color:var(--muted);font-size:13px;margin-top:10px">Tapping Pay twice reuses the same pending payment — you will only be charged once. If confirmation takes a moment, wait about a minute then tap Pay again.</p>
+      <p style="color:var(--muted);font-size:13px;margin-top:10px">Tapping Pay twice reuses the same pending payment — you will only be charged once. If confirmation takes a moment, wait 60 seconds then tap Pay again.</p>
+      <div class="msg ok" id="p-wait" style="display:none"></div>
       <div class="msg ok" id="p-retry" style="display:none"></div>
     </div>
     <div id="done" style="display:none">
@@ -34,6 +35,31 @@
 </div>
 <script>
 const code = location.pathname.split('/').pop();
+let waitTimer = null;
+function showWaitCountdown(box, secs, baseMessage) {
+  if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
+  let left = secs;
+  const render = () => {
+    box.style.display = 'block';
+    box.textContent = `${baseMessage} (try again in ${left}s)`;
+  };
+  render();
+  waitTimer = setInterval(() => {
+    left -= 1;
+    if (left <= 0) {
+      clearInterval(waitTimer); waitTimer = null;
+      box.textContent = `${baseMessage} You can tap Pay / refresh now.`;
+      const btn = document.getElementById('paybtn');
+      if (btn) btn.disabled = false;
+      return;
+    }
+    render();
+  }, 1000);
+}
+function rateLimitText(j) {
+  const s = j && j.retry_after_secs != null ? j.retry_after_secs : null;
+  return s != null ? `Too many attempts. Please wait ${s} seconds before trying again.` : 'Too many attempts. Please wait a little while before trying again.';
+}
 async function init() {
   try {
     const r = await fetch('/api/pay/' + code);
@@ -55,10 +81,13 @@ document.getElementById('pay').onsubmit = async (e) => {
   const errBox = document.getElementById('p-err');
   const okBox = document.getElementById('p-ok');
   const retryBox = document.getElementById('p-retry');
+  const waitBox = document.getElementById('p-wait');
   errBox.textContent = '';
   okBox.textContent = '';
   retryBox.style.display = 'none';
   retryBox.textContent = '';
+  waitBox.style.display = 'none';
+  waitBox.textContent = '';
   btn.disabled = true; // stay disabled while initiate is in flight so a double tap cannot create a duplicate
   try {
     const email = new FormData(e.target).get('email');
@@ -66,7 +95,10 @@ document.getElementById('pay').onsubmit = async (e) => {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email })
     });
     const j = await r.json();
-    if (!r.ok) throw new Error(j.error === 'paystack_not_configured' ? 'Payments are not enabled yet — please contact the business.' : (j.error || 'Could not start payment.'));
+    if (!r.ok) {
+      if (r.status === 429 || j.error === 'too_many_requests') throw new Error(rateLimitText(j));
+      throw new Error(j.error === 'paystack_not_configured' ? 'Payments are not enabled yet — please contact the business.' : (j.message || j.error || 'Could not start payment.'));
+    }
     if (j.reused) {
       okBox.textContent = 'Continuing your pending payment — you will only be charged once.';
     }
@@ -92,18 +124,31 @@ document.getElementById('pay').onsubmit = async (e) => {
             : (vj.message || 'Your payment was received and is shown to the merchant, who will contact you about a refund or balance. Please do not pay again.');
         } else if (v.ok && vj.status === 'pending') {
           // Still processing (bank transfer / USSD): keep waiting, not failed.
+          // Exact seconds come from the server (retry_after_secs); the pay
+          // button re-enables when the countdown ends.
           errBox.textContent = '';
-          okBox.textContent = vj.message || 'Your payment is still processing. Please wait a few minutes, then refresh or tap Pay again — do not start a new payment.';
-          btn.disabled = false;
+          okBox.textContent = '';
+          const secs = vj.retry_after_secs != null ? vj.retry_after_secs : 60;
+          showWaitCountdown(waitBox, secs, vj.message || 'Your payment is still processing. Please wait.');
+          btn.disabled = true;
         } else if (vj.status === 'failed' || (vj.retryable && vj.fresh)) {
           // Failed: nothing was charged, so start a fresh payment next tap
           // (initiate only reuses pending rows, so this creates a new one).
           retryBox.style.display = 'block';
           retryBox.textContent = vj.message || 'This payment failed and you were not charged. Tap Pay again to start a fresh payment.';
           btn.disabled = false;
+        } else if (vj.error === 'too_many_requests') {
+          errBox.textContent = rateLimitText(vj);
+          btn.disabled = false;
         } else if (vj.error === 'reference_mismatch') {
           errBox.textContent = vj.message || 'This payment reference belongs to a different payment link. Please use the correct link.';
           btn.disabled = false;
+        } else if (vj.error === 'verify_failed' || (vj.retryable && vj.status === 'pending')) {
+          // Unclear verification: exact wait from server + visible countdown.
+          errBox.textContent = '';
+          const secs = vj.retry_after_secs != null ? vj.retry_after_secs : 60;
+          showWaitCountdown(waitBox, secs, vj.message || 'We could not confirm your payment yet. Please wait.');
+          btn.disabled = true;
         } else {
           errBox.textContent = vj.message || 'We could not confirm your payment. If you were charged, the business will follow up.';
           btn.disabled = false;
