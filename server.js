@@ -110,10 +110,14 @@ const CLOSED_STATUSES = new Set(['abandoned', 'failed']);
 // an unclear verification. Shown as exact seconds on the pay page.
 const VERIFY_RETRY_WAIT_SECS = Number(process.env.VERIFY_RETRY_WAIT_SECS) || 60;
 
-// --- request throttling (in-memory, per IP) ---
+// --- request throttling (in-memory) ---
 // Slows down password guessing and floods of fake pending payments.
 // Limits are configurable by environment; all 429s carry retry_after_secs
 // so the client can show "wait N seconds".
+// The client IP comes from X-Forwarded-For ONLY when TRUST_PROXY=true in
+// .env (i.e. the app runs behind a proxy you control). Otherwise the socket
+// address is used, so a client cannot dodge limits by spoofing the header.
+const TRUST_PROXY = String(process.env.TRUST_PROXY || '').toLowerCase() === 'true';
 const RATE_LIMITS = {
   signup: {
     limit: Number(process.env.RATE_SIGNUP_LIMIT) || 10,
@@ -122,6 +126,7 @@ const RATE_LIMITS = {
   login: {
     limit: Number(process.env.RATE_LOGIN_LIMIT) || 10,
     windowSecs: Number(process.env.RATE_LOGIN_WINDOW_SECS) || 600,
+    perEmailLimit: Number(process.env.RATE_LOGIN_PER_EMAIL_LIMIT) || 10,
   },
   initiate: {
     limit: Number(process.env.RATE_INITIATE_LIMIT) || 20,
@@ -134,13 +139,23 @@ const RATE_LIMITS = {
 };
 const _hits = new Map(); // key -> number[] timestamps (ms)
 function clientIp(req) {
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+  if (TRUST_PROXY) {
+    const fwd = req.headers['x-forwarded-for'];
+    if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+  }
   return (req.socket && req.socket.remoteAddress) || 'unknown';
 }
+// Drop fully-expired buckets so the map stays small: iterate on each check
+// and delete keys whose window has passed and that hold no fresh hits.
 function checkRate(key, limit, windowSecs) {
   const now = Date.now();
   const windowMs = windowSecs * 1000;
+  for (const [k, arr] of _hits) {
+    while (arr.length && now - arr[0] > windowMs) arr.shift();
+    if (!arr.length) _hits.delete(k);
+    // Bound sweep cost: stop early on large maps.
+    if (_hits.size > 5000) break;
+  }
   let arr = _hits.get(key);
   if (!arr) { arr = []; _hits.set(key, arr); }
   while (arr.length && now - arr[0] > windowMs) arr.shift();
@@ -151,21 +166,32 @@ function checkRate(key, limit, windowSecs) {
   arr.push(now);
   return { allowed: true, retryAfterSecs: 0 };
 }
+function tooMany(res, retryAfterSecs) {
+  res.set('Retry-After', String(retryAfterSecs));
+  return res.status(429).json({
+    error: 'too_many_requests',
+    retry_after_secs: retryAfterSecs,
+    message: `Too many attempts. Please wait ${retryAfterSecs} seconds before trying again.`,
+  });
+}
 function rateLimit(bucket) {
   const cfg = RATE_LIMITS[bucket];
   return (req, res, next) => {
     const key = `${bucket}:${clientIp(req)}`;
     const r = checkRate(key, cfg.limit, cfg.windowSecs);
-    if (!r.allowed) {
-      res.set('Retry-After', String(r.retryAfterSecs));
-      return res.status(429).json({
-        error: 'too_many_requests',
-        retry_after_secs: r.retryAfterSecs,
-        message: `Too many attempts. Please wait ${r.retryAfterSecs} seconds before trying again.`,
-      });
-    }
+    if (!r.allowed) return tooMany(res, r.retryAfterSecs);
     next();
   };
+}
+// Extra guard on login: cap tries per email as well as per IP, so an attacker
+// rotating IPs cannot hammer one merchant account unchecked.
+function loginEmailLimit(req, res, next) {
+  const cfg = RATE_LIMITS.login;
+  const email = String((req.body || {}).email || '').toLowerCase();
+  if (!email) return next();
+  const r = checkRate(`login-email:${email}`, cfg.perEmailLimit, cfg.windowSecs);
+  if (!r.allowed) return tooMany(res, r.retryAfterSecs);
+  next();
 }
 
 function mismatchInfo(payment, chargedKobo) {
@@ -241,7 +267,7 @@ app.post('/api/auth/signup', rateLimit('signup'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/auth/login', rateLimit('login'), (req, res) => {
+app.post('/api/auth/login', rateLimit('login'), loginEmailLimit, (req, res) => {
   const { email, password } = req.body || {};
   const m = db.prepare('SELECT * FROM merchants WHERE email = ?').get((email || '').toLowerCase());
   if (!m || !bcrypt.compareSync(password || '', m.password_hash)) {
