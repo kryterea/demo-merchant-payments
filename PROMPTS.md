@@ -21,3 +21,7 @@ When a customer pays the wrong amount, the money did leave their account, so do 
 ## 5
 
 A few things about payments. When a customer pays less or more than the link amount, do not show it to me as a normal paid sale. Show me what they paid next to what the link asked for, so I know to refund or collect the rest. When Paystack says a payment is still processing, like a bank transfer or USSD, keep it pending and tell the customer to wait, not that it failed. Only mark a payment closed when Paystack says it was abandoned or failed. On my dashboard, show me how long a pending payment has been waiting and what to do next. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
+
+## 6
+
+Slow down anyone who tries many logins or starts many payments in a short time. When a refund cannot reach Paystack, tell me plainly and let me try again. When I enter zero or more than ten million naira, tell me why it is refused. Show the customer how many seconds to wait before trying again. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
