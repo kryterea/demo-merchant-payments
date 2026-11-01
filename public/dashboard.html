@@ -59,9 +59,9 @@ async function load() {
       `<div class="linkline"><span><b>${escapeHtml(l.title)}</b> — ₦${l.amountNaira}<br><a href="${l.url}" target="_blank">${l.url}</a></span><span style="color:var(--muted)">${new Date(l.created_at + 'Z').toLocaleString()}</span></div>`
     ).join('') : '<span style="color:var(--muted)">No links yet — create your first one above.</span>';
     const pays = await api('/api/payments');
-    document.getElementById('payments').innerHTML = pays.length ? `<table><tr><th>For</th><th>Customer</th><th>Amount</th><th>Status</th><th></th></tr>${pays.map(p =>
-      `<tr><td>${escapeHtml(p.link_title)}</td><td>${escapeHtml(p.customer_email || '—')}</td><td>₦${p.amountNaira}</td><td><span class="pill ${p.status}">${p.status}</span></td><td>${p.status === 'paid' ? `<button class="btn btn-ghost" data-refund="${p.id}">Refund</button>` : ''}</td></tr>`
-    ).join('')}</table>` : '<span style="color:var(--muted)">No payments yet — share a link to get paid.</span>';
+    document.getElementById('payments').innerHTML = pays.length ? `<table><tr><th>For</th><th>Customer</th><th>Amount</th><th>Reference</th><th>Status</th><th></th></tr>${pays.map(p =>
+      `<tr><td>${escapeHtml(p.link_title)}</td><td>${escapeHtml(p.customer_email || '—')}</td><td>₦${p.amountNaira}</td><td style="font-family:monospace;font-size:12px">${escapeHtml(p.reference)}</td><td><span class="pill ${p.status}">${p.status}</span></td><td>${p.status === 'paid' ? `<button class="btn btn-ghost" data-refund="${p.id}">Refund</button>` : ''}</td></tr>`
+    ).join('')}</table><p style="color:var(--muted);font-size:13px">Match rows using the Paystack reference + customer email. A repeat Pay tap reuses the same pending payment, so one sale shows one pending row.</p>` : '<span style="color:var(--muted)">No payments yet — share a link to get paid.</span>';
     document.querySelectorAll('[data-refund]').forEach(b => b.onclick = () => refund(b.dataset.refund, b));
   } catch (e) { err(e.message); }
 }

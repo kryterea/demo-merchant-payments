@@ -23,6 +23,8 @@
         <label>Your email<input name="email" type="email" required placeholder="customer@example.com"></label>
         <button class="btn" type="submit" id="paybtn">Pay with Paystack</button>
       </form>
+      <p style="color:var(--muted);font-size:13px;margin-top:10px">Tapping Pay twice reuses the same pending payment — you will only be charged once. If confirmation takes a moment, wait about a minute then tap Pay again.</p>
+      <div class="msg ok" id="p-retry" style="display:none"></div>
     </div>
     <div id="done" style="display:none">
       <h2>✅ Payment successful</h2>
@@ -51,8 +53,13 @@ document.getElementById('pay').onsubmit = async (e) => {
   e.preventDefault();
   const btn = document.getElementById('paybtn');
   const errBox = document.getElementById('p-err');
+  const okBox = document.getElementById('p-ok');
+  const retryBox = document.getElementById('p-retry');
   errBox.textContent = '';
-  btn.disabled = true;
+  okBox.textContent = '';
+  retryBox.style.display = 'none';
+  retryBox.textContent = '';
+  btn.disabled = true; // stay disabled while initiate is in flight so a double tap cannot create a duplicate
   try {
     const email = new FormData(e.target).get('email');
     const r = await fetch('/api/pay/' + code + '/initiate', {
@@ -60,6 +67,9 @@ document.getElementById('pay').onsubmit = async (e) => {
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error === 'paystack_not_configured' ? 'Payments are not enabled yet — please contact the business.' : (j.error || 'Could not start payment.'));
+    if (j.reused) {
+      okBox.textContent = 'Continuing your pending payment — you will only be charged once.';
+    }
     const handler = PaystackPop.setup({
       key: j.publicKey, email: j.email, amount: j.amountKobo, ref: j.reference, currency: 'NGN',
       callback: async function () {
@@ -70,8 +80,16 @@ document.getElementById('pay').onsubmit = async (e) => {
         if (v.ok && vj.status === 'paid') {
           document.getElementById('payform').style.display = 'none';
           document.getElementById('done').style.display = 'block';
+        } else if (vj.status === 'amount_mismatch' || vj.retryable) {
+          // Clear retry path on the same payment: tell the customer exactly what to do next.
+          retryBox.style.display = 'block';
+          retryBox.textContent = vj.message || 'Please tap Pay again to retry the same payment.';
+          btn.disabled = false;
+        } else if (vj.error === 'reference_mismatch') {
+          errBox.textContent = vj.message || 'This payment reference belongs to a different payment link. Please use the correct link.';
+          btn.disabled = false;
         } else {
-          errBox.textContent = 'We could not confirm your payment. If you were charged, the business will follow up.';
+          errBox.textContent = vj.message || 'We could not confirm your payment. If you were charged, the business will follow up.';
           btn.disabled = false;
         }
       },
