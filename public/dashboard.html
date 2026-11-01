@@ -34,6 +34,8 @@
 
   <div class="card">
     <h3>Payments</h3>
+    <div class="msg err" id="r-err" style="display:none"></div>
+    <div class="msg ok" id="r-ok" style="display:none"></div>
     <div id="payments"><span style="color:var(--muted)">Loading…</span></div>
   </div>
 </div>
@@ -43,7 +45,13 @@ async function api(url, opts = {}) {
   const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
   if (r.status === 401) { location.href = '/'; return; }
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || 'request_failed');
+  if (!r.ok) {
+    if (r.status === 429 || j.error === 'too_many_requests') {
+      const s = j.retry_after_secs != null ? j.retry_after_secs : '?';
+      throw new Error(`Too many attempts. Please wait ${s} seconds before trying again.`);
+    }
+    throw new Error(j.message || j.error || 'request_failed');
+  }
   return j;
 }
 async function load() {
@@ -76,8 +84,21 @@ async function load() {
 async function refund(id, btn) {
   if (!confirm('Refund this customer in full via Paystack?')) return;
   btn.disabled = true;
-  try { const r = await api(`/api/payments/${id}/refund`, { method: 'POST' }); alert('Refund ' + r.status); load(); }
-  catch (e) { alert('Refund failed: ' + e.message); btn.disabled = false; }
+  const errBox = document.getElementById('r-err');
+  const okBox = document.getElementById('r-ok');
+  errBox.style.display = 'none'; errBox.textContent = '';
+  okBox.style.display = 'none'; okBox.textContent = '';
+  try {
+    const r = await api(`/api/payments/${id}/refund`, { method: 'POST' });
+    okBox.style.display = 'block';
+    okBox.textContent = r.message || ('Refund ' + r.status);
+    load();
+  } catch (e) {
+    // Refund did not reach Paystack: payment is still paid, retry is safe.
+    errBox.style.display = 'block';
+    errBox.textContent = (e.message || 'Refund failed.') + ' The payment is still paid and no money moved — press Refund again to retry.';
+    btn.disabled = false;
+  }
 }
 document.getElementById('create').onsubmit = async (e) => {
   e.preventDefault();
@@ -91,7 +112,14 @@ document.getElementById('create').onsubmit = async (e) => {
     s.style.display = 'block';
     s.innerHTML = `Send this to your customer: <a href="${l.url}" target="_blank">${l.url}</a>`;
     e.target.reset(); load();
-  } catch (ex) { document.getElementById('c-err').textContent = ex.message === 'amount_invalid' ? 'Enter a valid amount in naira.' : ex.message; }
+  } catch (ex) {
+    const map = {
+      amount_must_be_positive: 'Amount must be more than ₦0. Enter an amount above zero.',
+      amount_too_large: 'Amount is above the ₦10,000,000 limit. Enter ₦10,000,000 or less, or split it into smaller links.',
+      amount_invalid: 'Amount must be more than ₦0 and not more than ₦10,000,000.',
+    };
+    document.getElementById('c-err').textContent = map[ex.message] || ex.message;
+  }
 };
 document.getElementById('logout').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); location.href = '/'; };
 function escapeHtml(s) { return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }

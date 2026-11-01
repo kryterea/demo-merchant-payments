@@ -39,11 +39,12 @@ Tech summary: Node.js + Express (`server.js`), SQLite via `better-sqlite3` (`dat
 - Signup: `POST /api/auth/signup` with `{businessName, email, password}` (min 6 chars, bcrypt hash, email unique, case-insensitive).
 - Login/logout with httpOnly session cookie (`sid`, 7-day expiry): `POST /api/auth/login`, `POST /api/auth/logout`.
 - Current merchant: `GET /api/me` returns business name, email, and a `paystackConfigured` flag.
+- Request limits (in-memory, per IP, configurable by env): signup 10 / 10 min (`RATE_SIGNUP_LIMIT`, `RATE_SIGNUP_WINDOW_SECS`), login 10 / 10 min (`RATE_LOGIN_LIMIT`, `RATE_LOGIN_WINDOW_SECS`), pay initiate 20 / 10 min (`RATE_INITIATE_LIMIT`, `RATE_INITIATE_WINDOW_SECS`), pay verify 30 / 10 min (`RATE_VERIFY_LIMIT`, `RATE_VERIFY_WINDOW_SECS`). Over the limit → `429 { error: 'too_many_requests', retry_after_secs, message }` plus a `Retry-After` header; all pages show "Too many attempts. Please wait Ns before trying again."
 - Pages: `/` (landing + signup/login forms), `/dashboard` (protected client-side; redirects to `/` on 401).
 
 ### 4.2 Payment links
 
-- Create: `POST /api/links` with `{amountNaira, title, description?}`. Amount validated: > 0, ≤ ₦10,000,000, stored in **kobo** (integer).
+- Create: `POST /api/links` with `{amountNaira, title, description?}`. Amount validated: > 0, ≤ ₦10,000,000, stored in **kobo** (integer). Zero or negative → `400 { error: 'amount_must_be_positive', message: 'Amount must be more than ₦0 …' }`; above ₦10,000,000 → `400 { error: 'amount_too_large', message: 'Amount is above the ₦10,000,000 limit …' }`. Both are shown inline on the dashboard create form.
 - List: `GET /api/links` — merchant's own links, newest first, each with a shareable URL `${APP_BASE_URL}/pay/:code`.
 - Link code: random 8-hex string (`crypto.randomBytes(4)`), unique in `links.code`.
 - Dashboard (`public/dashboard.html`): create-link form, link list with copyable URLs, validation errors shown inline.
@@ -72,7 +73,7 @@ When Paystack reports the charge as still moving (`ongoing`, `pending`, `process
 
 #### 4.3.4 Pending verification wait rule
 
-When Paystack cannot be verified at that moment (webhook verify fails, or client verify errors), the payment **stays `pending`** and the app tells both sides what happens next: the customer is told to wait about a minute then tap Pay again (the pending row is reused) or refresh, and the webhook path is retried by the client-side verify. No silent indefinite wait. The merchant dashboard shows every pending row with **how long it has been waiting** (`waiting_label`, e.g. "waiting 2m 10s") and **what to do next** (`next_step`: under 5 min → "still within normal bank-transfer/USSD window: wait, then ask the customer to refresh"; 5+ min → "ask the customer to tap Pay / refresh so verify runs again, then check the Paystack dashboard for this reference").
+When Paystack cannot be verified at that moment (webhook verify fails, or client verify errors), the payment **stays `pending`** and the app tells both sides an **exact wait in seconds**: verify responses carry `retry_after_secs` (default 60, configurable via `VERIFY_RETRY_WAIT_SECS`) and a message naming the seconds (e.g. "Please wait 60 seconds, then tap Pay again (your pending payment will be reused) or refresh"). The pay page shows a visible countdown ("try again in Ns") and re-enables Pay when it ends. The webhook path is retried by the client-side verify. No silent indefinite wait. The merchant dashboard shows every pending row with **how long it has been waiting** (`waiting_label`, e.g. "waiting 2m 10s") and **what to do next** (`next_step`: under 5 min → "still within normal bank-transfer/USSD window: wait, then ask the customer to refresh"; 5+ min → "ask the customer to tap Pay / refresh so verify runs again, then check the Paystack dashboard for this reference").
 
 #### 4.3.5 Cross-link reference guard
 
@@ -84,7 +85,7 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 
 - List: `GET /api/payments` — merchant's payments joined with link titles, newest first (limit 200), amounts formatted in ₦, each row showing the Paystack reference + customer email so merchants can match rows. Paid-vs-asked mismatch rows include `expected_kobo/expectedNaira`, `amount_mismatch/underpaid/overpaid`, and `next_step`; pending rows include `waiting_secs/waiting_label` and `next_step`.
 - Statuses: `pending`, `paid`, `failed`, `abandoned`, `refunded`, `refund_pending`.
-- Refund: `POST /api/payments/:id/refund` — only `paid` payments with a stored `paystack_id`. Calls Paystack `POST /refund` with the transaction id. `refunded` on success, `refund_pending` if Paystack queues it. Full refunds only.
+- Refund: `POST /api/payments/:id/refund` — only `paid` payments with a stored `paystack_id`. Calls Paystack `POST /refund` with the transaction id. `refunded` on success, `refund_pending` if Paystack queues it. Full refunds only. Failure rule: when the Paystack call cannot complete (network error, Paystack error/refusal), the payment **stays `paid`** and the API returns `502 { error: 'refund_not_completed', status: 'paid', retryable: true, message }` with a plain-language message ("The refund could not reach Paystack, so the payment is still paid and no money moved … press Refund again"). The dashboard shows this inline above the payments table with retry guidance — never a bare popup error name. A retry after failure is always safe (no state changed).
 - UI: payments table with status pills and a per-row Refund button (with confirm dialog).
 
 ### 4.5 Data model (SQLite)
@@ -96,11 +97,11 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 
 ### 4.6 Configuration
 
-`.env` keys (see `.env.example`): `PORT`, `SESSION_SECRET`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_PUBLIC_KEY`, `APP_BASE_URL` (used to build shareable links).
+`.env` keys (see `.env.example`): `PORT`, `SESSION_SECRET`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_PUBLIC_KEY`, `APP_BASE_URL` (used to build shareable links), `VERIFY_RETRY_WAIT_SECS` (default 60), `RATE_SIGNUP_LIMIT/_WINDOW_SECS`, `RATE_LOGIN_LIMIT/_WINDOW_SECS`, `RATE_INITIATE_LIMIT/_WINDOW_SECS`, `RATE_VERIFY_LIMIT/_WINDOW_SECS`.
 
 ## 5. Current limitations (known)
 
-- Single-server sessions; no password reset, email verification, or rate limiting.
+- Single-server sessions with in-memory per-IP request limits on signup/login/pay initiate/pay verify (see §4.1); no password reset or email verification (still outstanding).
 - One-time payments only — no recurring billing (see §6).
 - Full refunds only; no partial refunds, no dispute handling.
 - No search/filter/export on payments; list capped at 200.
