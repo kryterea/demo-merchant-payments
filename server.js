@@ -113,7 +113,14 @@ app.post('/webhook/paystack', express.raw({ type: 'application/json' }), async (
       if (payment && payment.status !== 'paid' && payment.status !== 'refunded') {
         try {
           const data = await paystackVerify(event.data.reference);
-          if (data.status === 'success' && data.amount === payment.amount_kobo) markPaid(payment, data);
+          // Any successful charge is money that left the customer: record it as
+          // paid (even on amount mismatch) so the merchant can see/refund it.
+          if (data.status === 'success') {
+            markPaid(payment, data);
+            if (typeof data.amount === 'number' && data.amount !== payment.amount_kobo) {
+              db.prepare('UPDATE payments SET amount_kobo = ? WHERE id = ?').run(data.amount, payment.id);
+            }
+          }
         } catch (e) { /* leave pending; client-side verify will retry */ }
       }
     }
@@ -260,6 +267,22 @@ app.post('/api/pay/:code/initiate', (req, res) => {
   res.json({ publicKey: PAYSTACK_PUBLIC, reference, amountKobo: link.amount_kobo, email: emailNorm, reused: false });
 });
 
+// Customer closed the Paystack popup without paying: close out the pending row
+// as abandoned so a later tap starts a fresh payment instead of piling up
+// pending rows. Only the pending row for this reference is touched.
+app.post('/api/pay/:code/abandon', (req, res) => {
+  const { reference } = req.body || {};
+  if (!reference) return res.status(400).json({ error: 'reference_required' });
+  const payment = db.prepare('SELECT * FROM payments WHERE reference = ?').get(reference);
+  if (!payment) return res.status(404).json({ error: 'payment_not_found' });
+  const link = db.prepare('SELECT * FROM links WHERE id = ?').get(payment.link_id);
+  if (!link || link.code !== req.params.code) return res.status(400).json({ error: 'reference_mismatch' });
+  if (payment.status === 'pending') {
+    db.prepare(`UPDATE payments SET status = 'abandoned' WHERE id = ?`).run(payment.id);
+  }
+  res.json({ ok: true, status: payment.status === 'pending' ? 'abandoned' : payment.status });
+});
+
 app.post('/api/pay/:code/verify', async (req, res) => {
   if (!PAYSTACK_SECRET) return res.status(503).json({ error: 'paystack_not_configured' });
   const { reference } = req.body || {};
@@ -267,31 +290,49 @@ app.post('/api/pay/:code/verify', async (req, res) => {
   const payment = db.prepare('SELECT * FROM payments WHERE reference = ?').get(reference);
   if (!payment) return res.status(404).json({ error: 'payment_not_found' });
   const link = db.prepare('SELECT * FROM links WHERE id = ?').get(payment.link_id);
-  // Cross-link reference guard (PRD §4.3.4): a reference belongs to the link that
+  // Cross-link reference guard (PRD §4.3.5): a reference belongs to the link that
   // created it. Verifying it under a different link code is rejected with a clear
   // message so the customer retries on the correct pay page instead of getting stuck.
   if (!link || link.code !== req.params.code) return res.status(400).json({ error: 'reference_mismatch', message: 'This payment reference belongs to a different payment link. Please go back to the correct link and try again.' });
   if (payment.status === 'paid') return res.json({ ok: true, status: 'paid' });
   try {
     const data = await paystackVerify(reference);
-    if (data.status === 'success' && data.amount === payment.amount_kobo) {
-      markPaid(payment, data);
-      return res.json({ ok: true, status: 'paid' });
+    if (data.status === 'success') {
+      // Money left the customer's account, even if the amount is wrong.
+      // Record it as paid so the merchant sees it on the dashboard and can refund it.
+      // Never tell the customer they were not charged in this branch.
+      const paid = markPaid(payment, data);
+      if (data.amount === payment.amount_kobo) {
+        return res.json({ ok: true, status: 'paid' });
+      }
+      if (typeof data.amount === 'number' && data.amount !== payment.amount_kobo) {
+        db.prepare('UPDATE payments SET amount_kobo = ? WHERE id = ?').run(data.amount, payment.id);
+      }
+      const expectedNaira = naira(payment.amount_kobo);
+      const paidNaira = (typeof data.amount === 'number') ? naira(data.amount) : null;
+      return res.json({
+        ok: true,
+        status: 'paid',
+        amount_mismatch: true,
+        reference: payment.reference,
+        message: `You paid${paidNaira ? ` ₦${paidNaira}` : ''} which does not match the link amount (₦${expectedNaira}). Your payment was received and is shown to the merchant, who will contact you about a refund or balance. Please do not pay again.`,
+      });
     }
-    // Amount-mismatch retry rule (PRD §4.3.2): keep the payment pending and give
-    // the customer a clear retry path on the same reference instead of leaving
-    // the payment stuck as failed with no next step.
-    const expectedNaira = naira(payment.amount_kobo);
-    const paidNaira = (typeof data.amount === 'number') ? naira(data.amount) : null;
+    // Paystack confirms the charge did NOT succeed: mark failed so the
+    // customer can start a fresh payment (initiate only reuses pending rows).
+    if (payment.status === 'pending') {
+      db.prepare(`UPDATE payments SET status = 'failed' WHERE id = ?`).run(payment.id);
+    }
     return res.json({
       ok: false,
-      status: 'amount_mismatch',
+      status: 'failed',
       retryable: true,
+      fresh: true,
       reference: payment.reference,
-      message: `The amount paid${paidNaira ? ` (₦${paidNaira})` : ''} does not match the link amount (₦${expectedNaira}). You have not been charged for this link — tap Pay again to retry the same payment with the correct amount.`,
+      message: 'This payment failed and you were not charged for it. Tap Pay again to start a fresh payment.',
     });
   } catch (e) {
-    // Webhook-wait timing rule (PRD §4.3.3): when Paystack cannot be verified right
+    // Webhook-wait timing rule (PRD §4.3.4): when Paystack cannot be verified right
     // now the payment stays pending and both sides are told to wait briefly, then
     // tap Pay / refresh — the pending row is reused so no duplicate is created.
     return res.status(502).json({

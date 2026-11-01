@@ -62,15 +62,19 @@ Tech summary: Node.js + Express (`server.js`), SQLite via `better-sqlite3` (`dat
 
 A second tap on Pay for the same link + customer email while a payment is still `pending` **reuses the same pending row** (same reference) and does not create a second row. The dashboard therefore shows one pending row per sale, and the customer is charged at most once. This is shown on the pay page ("Tapping Pay twice reuses the same pending payment") and the dashboard ("A repeat Pay tap reuses the same pending payment").
 
-#### 4.3.2 Amount-mismatch retry rule
+#### 4.3.2 Amount-mismatch rule (money moved — mark paid, refundable)
 
-When the Paystack-confirmed amount does not exactly match the link amount, the payment **stays `pending`** (it is not marked `failed`) and verify returns `{ ok: false, status: 'amount_mismatch', retryable: true, reference, message }`. The pay page shows the message with a clear next step: tap Pay again to retry the same payment with the correct amount.
+When the Paystack-confirmed charge succeeded but the amount does not exactly match the link amount, the money **did leave the customer's account**, so the payment is marked **`paid`** (with the actual charged amount stored) and appears on the merchant dashboard where it can be **refunded**. Verify returns `{ ok: true, status: 'paid', amount_mismatch: true, message }`. The pay page never says "you were not charged" in this case — it tells the customer the payment was received, not to pay again, and that the merchant will follow up about a refund or balance.
 
-#### 4.3.3 Pending verification wait rule
+#### 4.3.3 Failed or closed payments start fresh
+
+When Paystack confirms the charge did **not** succeed, the payment is marked **`failed`** and verify returns `{ ok: false, status: 'failed', retryable: true, fresh: true }` telling the customer they were not charged and to tap Pay again for a **fresh** payment (initiate only reuses `pending` rows, so the next tap creates a new row). When the customer closes the Paystack popup without paying, the client calls `POST /api/pay/:code/abandon`, which marks that `pending` row **`abandoned`** so the next tap also starts fresh instead of reusing a stale row.
+
+#### 4.3.4 Pending verification wait rule
 
 When Paystack cannot be verified at that moment (webhook verify fails, or client verify errors), the payment **stays `pending`** and the app tells both sides what happens next: the customer is told to wait about a minute then tap Pay again (the pending row is reused) or refresh, and the webhook path is retried by the client-side verify. No silent indefinite wait.
 
-#### 4.3.4 Cross-link reference guard
+#### 4.3.5 Cross-link reference guard
 
 A payment reference belongs to the link that created it. Calling `POST /api/pay/:otherCode/verify` with a reference from a different link is rejected as `400 { error: 'reference_mismatch' }` with a plain-language message telling the customer to use the correct link. This prevents charging or confusing the wrong sale.
 
@@ -79,7 +83,7 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 ### 4.4 Dashboard payments and refunds
 
 - List: `GET /api/payments` — merchant's payments joined with link titles, newest first (limit 200), amounts formatted in ₦, each row showing the Paystack reference + customer email so merchants can match rows.
-- Statuses: `pending`, `paid`, `failed`, `refunded`, `refund_pending`.
+- Statuses: `pending`, `paid`, `failed`, `abandoned`, `refunded`, `refund_pending`.
 - Refund: `POST /api/payments/:id/refund` — only `paid` payments with a stored `paystack_id`. Calls Paystack `POST /refund` with the transaction id. `refunded` on success, `refund_pending` if Paystack queues it. Full refunds only.
 - UI: payments table with status pills and a per-row Refund button (with confirm dialog).
 
@@ -102,7 +106,7 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 - No search/filter/export on payments; list capped at 200.
 - Links cannot be edited, disabled, or given expiry dates or stock limits.
 - No customer receipts beyond the Paystack confirmation; no merchant notifications (email/SMS).
-- Amount mismatch on verify keeps the payment `pending` with a customer retry path (see §4.3.2).
+- Amount mismatch on verify is marked `paid` with the actual charged amount and is refundable (see §4.3.2).
 
 ## 6. What is next — Monthly Subscriptions (priority feature)
 

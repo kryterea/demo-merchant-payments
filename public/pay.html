@@ -77,13 +77,22 @@ document.getElementById('pay').onsubmit = async (e) => {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reference: j.reference })
         });
         const vj = await v.json().catch(() => ({}));
-        if (v.ok && vj.status === 'paid') {
+        if (v.ok && vj.status === 'paid' && !vj.amount_mismatch) {
           document.getElementById('payform').style.display = 'none';
           document.getElementById('done').style.display = 'block';
-        } else if (vj.status === 'amount_mismatch' || vj.retryable) {
-          // Clear retry path on the same payment: tell the customer exactly what to do next.
+        } else if (v.ok && vj.status === 'paid' && vj.amount_mismatch) {
+          // Money left the customer's account, so never say "not charged".
+          // The payment is on the merchant dashboard for a refund/balance follow-up.
+          document.getElementById('payform').style.display = 'none';
+          const done = document.getElementById('done');
+          done.style.display = 'block';
+          done.querySelector('h2').textContent = '⚠️ Payment received with wrong amount';
+          done.querySelector('p').textContent = vj.message || 'Your payment was received and is shown to the merchant, who will contact you about a refund or balance. Please do not pay again.';
+        } else if (vj.status === 'failed' || (vj.retryable && vj.fresh)) {
+          // Failed: nothing was charged, so start a fresh payment next tap
+          // (initiate only reuses pending rows, so this creates a new one).
           retryBox.style.display = 'block';
-          retryBox.textContent = vj.message || 'Please tap Pay again to retry the same payment.';
+          retryBox.textContent = vj.message || 'This payment failed and you were not charged. Tap Pay again to start a fresh payment.';
           btn.disabled = false;
         } else if (vj.error === 'reference_mismatch') {
           errBox.textContent = vj.message || 'This payment reference belongs to a different payment link. Please use the correct link.';
@@ -93,7 +102,15 @@ document.getElementById('pay').onsubmit = async (e) => {
           btn.disabled = false;
         }
       },
-      onClose: function () { btn.disabled = false; }
+      onClose: function () {
+        // Popup closed without paying: mark the pending row abandoned so the
+        // next tap starts a fresh payment instead of reusing a stale row.
+        fetch('/api/pay/' + code + '/abandon', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reference: j.reference })
+        }).catch(() => {});
+        okBox.textContent = 'Payment window closed — tap Pay again to start a fresh payment.';
+        btn.disabled = false;
+      }
     });
     handler.openIframe();
   } catch (err) { errBox.textContent = err.message; btn.disabled = false; }
