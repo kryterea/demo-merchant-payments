@@ -13,3 +13,7 @@ Write a PRD for this app in docs/PRD.md so my team and clients know what it does
 ## 3
 
 Kryterea has a change I approved for this app. Use the lifecycle-copilot tools to find it with list_changes, read it, and fix it on this branch. Tell Kryterea what you fixed for each finding with report_fix, then commit. Do not push and do not ask for a re-check. I will open the pull request.
+
+## 4
+
+When a customer pays the wrong amount, the money did leave their account, so do not tell them they were not charged. Show me that payment on the dashboard so I can refund it. If a payment failed or the customer closed it, let them start a fresh one. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
