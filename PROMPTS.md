@@ -41,3 +41,7 @@ Write in the PRD what I see when a refund cannot reach Paystack: the message, th
 _Sent in the same session after prompt 8 stopped when it tried to read .env._
 
 Never read .env, it holds my keys. Add any new setting to .env.example instead. Now finish prompt 8. Keep any test files inside this folder. Tell Kryterea what you changed with report_fix, then commit. Do not push and do not ask for a re-check.
+
+## 10
+
+The PRD says the app limits repeated signups, logins and payment attempts, but its acceptance checklist has no check for that. Add checks a tester can follow: what a visitor sees after too many tries, that the message gives the wait in seconds, and that trying again after the wait works. Change only the PRD. Keep any test files inside this folder. Tell Kryterea what you changed with report_fix if a finding covers it, then commit. Do not push and do not ask for a re-check.
