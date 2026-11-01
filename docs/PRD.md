@@ -42,6 +42,14 @@ Tech summary: Node.js + Express (`server.js`), SQLite via `better-sqlite3` (`dat
 - Request limits (in-memory, configurable by env): per-IP caps on signup 10 / 10 min (`RATE_SIGNUP_LIMIT`, `RATE_SIGNUP_WINDOW_SECS`), login 10 / 10 min (`RATE_LOGIN_LIMIT`, `RATE_LOGIN_WINDOW_SECS`), pay initiate 20 / 10 min (`RATE_INITIATE_LIMIT`, `RATE_INITIATE_WINDOW_SECS`), pay verify 30 / 10 min (`RATE_VERIFY_LIMIT`, `RATE_VERIFY_WINDOW_SECS`) — plus a per-email cap on login (`RATE_LOGIN_PER_EMAIL_LIMIT`, default 10 / 10 min) so rotating IPs cannot hammer one account. Over the limit → `429 { error: 'too_many_requests', retry_after_secs, message }` plus a `Retry-After` header; all pages show "Too many attempts. Please wait Ns before trying again." The client IP comes from `X-Forwarded-For` only when `TRUST_PROXY=true` in `.env` (set it only when the app runs behind your own proxy); otherwise the socket address is used, so a client cannot dodge limits by spoofing the header. Expired attempt buckets are deleted on each check so memory stays small.
 - Pages: `/` (landing + signup/login forms), `/dashboard` (protected client-side; redirects to `/` on 401).
 
+#### 4.1.1 Request-limit acceptance checks
+
+Tester setup: use the default caps (signup 10 / 10 min, login 10 / 10 min per IP plus 10 / 10 min per email, pay initiate 20 / 10 min, pay verify 30 / 10 min), or set a short window via `RATE_*_WINDOW_SECS` for a faster retest.
+
+- [ ] After too many tries the visitor is blocked with a clear message: exceed any cap (e.g. 11 rapid signups, 11 rapid logins, 21 rapid pay initiates) and the next request returns `429 { error: 'too_many_requests', retry_after_secs, message }` plus a `Retry-After` header; the page shows the message inline ("Too many attempts. Please wait Ns before trying again.") in the signup/login error box or the pay page error box.
+- [ ] The blocked message names the wait in seconds: the `Ns` in the shown message equals `retry_after_secs` in the 429 body and the `Retry-After` header value.
+- [ ] Trying again after the wait works: wait the shown N seconds (or until the window expires), repeat the same valid request, and it is accepted (no longer 429).
+
 ### 4.2 Payment links
 
 - Create: `POST /api/links` with `{amountNaira, title, description?}`. Amount validated: > 0, ≤ ₦10,000,000, stored in **kobo** (integer). Zero or negative → `400 { error: 'amount_must_be_positive', message: 'Amount must be more than ₦0 …' }`; above ₦10,000,000 → `400 { error: 'amount_too_large', message: 'Amount is above the ₦10,000,000 limit …' }`. Both are shown inline on the dashboard create form.
